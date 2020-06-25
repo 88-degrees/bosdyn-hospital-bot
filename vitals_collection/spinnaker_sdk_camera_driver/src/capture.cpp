@@ -54,7 +54,7 @@ acquisition::Capture::Capture(): it_(nh_), nh_pvt_ ("~") {
         if (mem >= 1000)
             ROS_INFO_STREAM("[ OK ] USB memory: "<<mem<<" MB");
         else{
-            ROS_FATAL_STREAM("  USB memory on system too low ("<<mem<<" MB)! Must be at least 1000 MB. Run: \nsudo sh -c \"echo 1000 > /sys/module/usbcore/parameters/usbfs_memory_mb\"\n Terminating...");
+	  ROS_FATAL_STREAM("  USB memory on system too low ("<<mem<<" MB)! Must be at least 1000 MB. Run: \nsudo sh -c \"echo 1000 > /sys/module/usbcore/parameters/usbfs_memory_mb\"\n Terminating...");
             ros::shutdown();
         }
     } else {
@@ -63,7 +63,9 @@ acquisition::Capture::Capture(): it_(nh_), nh_pvt_ ("~") {
     }
 
     // default values for the parameters are set here. Should be removed eventually!!
-    exposure_time_ = 0 ; // default as 0 = auto exposure
+    trigger_slave_from_master_ = false;
+    exposure_time_ = 1000;
+    gain_ = 0.0; // default as 0 = no gain
     soft_framerate_ = 20; //default soft framrate
     ext_ = ".bmp";
     SOFT_FRAME_RATE_CTRL_ = false;
@@ -77,12 +79,13 @@ acquisition::Capture::Capture(): it_(nh_), nh_pvt_ ("~") {
     nframes_ = -1;
     FIXED_NUM_FRAMES_ = false;
     MAX_RATE_SAVE_ = false;
-    skip_num_ = 20; 
+    rate_div_ = 1;
+    rate_cut_ = 0;
     init_delay_ = 1; 
     master_fps_ = 20.0;
     binning_ = 1;
     todays_date_ = todays_date();
-    
+
     dump_img_ = "dump" + ext_;
 
     grab_time_ = 0;
@@ -112,7 +115,10 @@ acquisition::Capture::Capture(): it_(nh_), nh_pvt_ ("~") {
     system_ = System::GetInstance();
 
     load_cameras();
- 
+
+    enabled_ = true;
+    Enable_ = nh_.advertiseService("camera_array_stream_enable", &Capture::onEnable, this);
+
     //initializing the ros publisher
     acquisition_pub = nh_.advertise<spinnaker_sdk_camera_driver::SpinnakerImageNames>("camera", 1000);
     //dynamic reconfigure
@@ -142,7 +148,9 @@ acquisition::Capture::Capture(ros::NodeHandle nodehandl, ros::NodeHandle private
     }
 
     // default values for the parameters are set here. Should be removed eventually!!
-    exposure_time_ = 0 ; // default as 0 = auto exposure
+    trigger_slave_from_master_ = false;
+    exposure_time_ = 1000;
+    gain_ = 0.0; // default as 0 = no gain
     soft_framerate_ = 20; //default soft framrate
     ext_ = ".bmp";
     SOFT_FRAME_RATE_CTRL_ = false;
@@ -156,7 +164,8 @@ acquisition::Capture::Capture(ros::NodeHandle nodehandl, ros::NodeHandle private
     nframes_ = -1;
     FIXED_NUM_FRAMES_ = false;
     MAX_RATE_SAVE_ = false;
-    skip_num_ = 20;
+    rate_div_ = 1;
+    rate_cut_ = 0;
     init_delay_ = 1;
     master_fps_ = 20.0;
     binning_ = 1;
@@ -191,6 +200,9 @@ acquisition::Capture::Capture(ros::NodeHandle nodehandl, ros::NodeHandle private
     system_ = System::GetInstance();
 
     load_cameras();
+
+    enabled_ = true;
+    Enable_ = nh_.advertiseService("camera_array_stream_enable", &Capture::onEnable, this);
 
     //initializing the ros publisher
     acquisition_pub = nh_.advertise<spinnaker_sdk_camera_driver::SpinnakerImageNames>("camera", 1000);
@@ -247,7 +259,7 @@ void acquisition::Capture::load_cameras() {
         
                 cams.push_back(cam);
                 
-                camera_image_pubs.push_back(it_.advertiseCamera("camera_array/"+cam_names_[j]+"/image_raw", 1));
+                camera_image_pubs.push_back(it_.advertiseCamera("camera_array/"+cam_names_[j]+"/image_raw", 70));
                 //camera_info_pubs.push_back(nh_.advertise<sensor_msgs::CameraInfo>("camera_array/"+cam_names_[j]+"/camera_info", 1));
 
                 img_msgs.push_back(sensor_msgs::ImagePtr());
@@ -416,13 +428,13 @@ void acquisition::Capture::read_parameters() {
         ROS_INFO("  Displaying timing details: %s",TIME_BENCHMARK_?"true":"false");
         else ROS_WARN("  'time' Parameter not set, using default behavior time=%s",TIME_BENCHMARK_?"true":"false");
 
-    if (nh_pvt_.getParam("skip", skip_num_)){
-        if (skip_num_ >0) ROS_INFO("  No. of images to skip set to: %d",skip_num_);
+    if (nh_pvt_.getParam("rate_div", rate_div_)){
+        if (rate_div_ > 0) ROS_INFO("  No. of images to rate_div set to: %d",rate_div_);
         else {
-            skip_num_=20;
-            ROS_WARN("  Provided 'skip' is not valid, using default behavior, skip=%d",skip_num_);
+            rate_div_=1;
+            ROS_WARN("  Provided 'rate_div' is not valid, using default behavior, rate_div=%d",rate_div_);
         }
-    } else ROS_WARN("  'skip' Parameter not set, using default behavior: skip=%d",skip_num_);
+    } else ROS_WARN("  'rate_div' Parameter not set, using default behavior: rate_div=%d",rate_div_);
 
     if (nh_pvt_.getParam("delay", init_delay_)){
         if (init_delay_>=0) ROS_INFO("  Init sleep delays set to : %0.2f sec",init_delay_);
@@ -445,6 +457,19 @@ void acquisition::Capture::read_parameters() {
         if (exposure_time_ >0) ROS_INFO("  Exposure set to: %.1f",exposure_time_);
         else ROS_INFO("  'exposure_time'=%0.f, Setting autoexposure",exposure_time_);
     } else ROS_WARN("  'exposure_time' Parameter not set, using default behavior: Automatic Exposure ");
+
+    if (nh_pvt_.getParam("trigger_slave_from_master", trigger_slave_from_master_)){
+        if (trigger_slave_from_master_) {
+            ROS_INFO("Trigger slave from master");
+        } else {
+            ROS_INFO("Free-run the slave cameras");
+        }
+    } else ROS_WARN("  'trigger_slave_from_master' Parameter not set, using default behavior: free-running slave cameras");
+
+    if (nh_pvt_.getParam("gain", gain_)){
+        if (gain_ >=0.0) ROS_INFO("  Gain set to: %.1f",gain_);
+        else ROS_INFO("  'gain'=%0.f, Setting autogain",gain_);
+    } else ROS_WARN("  'gain' Parameter not set, using default behavior: Automatic Gain ");
 
     if (nh_pvt_.getParam("target_grey_value", target_grey_value_)){
         if (target_grey_value_ >0) ROS_INFO("  target_grey_value set to: %.1f",target_grey_value_);
@@ -628,8 +653,12 @@ void acquisition::Capture::init_cameras(bool soft = false) {
                 } else {
                     cams[i].setEnumValue("ExposureAuto", "Continuous");
                 }
-		cams[i].setEnumValue("GainAuto", "Off");
-		cams[i].setFloatValue("Gain", 0.0);
+                if (gain_ >= 0.0) { 
+                    cams[i].setEnumValue("GainAuto", "Off");
+                    cams[i].setFloatValue("Gain", gain_);
+                } else {
+                    cams[i].setEnumValue("GainAuto", "Continuous");
+                }
                 /*if (target_grey_value_ > 4.0) {
                     cams[i].setEnumValue("AutoExposureTargetGreyValueAuto", "Off");
                     cams[i].setFloatValue("AutoExposureTargetGreyValue", target_grey_value_);
@@ -639,42 +668,38 @@ void acquisition::Capture::init_cameras(bool soft = false) {
 
                 // cams[i].setIntValue("DecimationHorizontal", decimation_);
                 // cams[i].setIntValue("DecimationVertical", decimation_);
-		//cams[i].setBoolValue("AcquisitionFrameRateEnable", true);
+                //cams[i].setBoolValue("AcquisitionFrameRateEnable", true);
                 //cams[i].setFloatValue("AcquisitionFrameRate", 35.0);
 
                 if (color_)
                     cams[i].setEnumValue("PixelFormat", "BGR8");
-                    else
-                        cams[i].setEnumValue("PixelFormat", "Mono8");
-                cams[i].setEnumValue("AcquisitionMode", "Continuous");
-		cams[i].setEnumValue("TriggerMode", "Off");
-                
-                // set only master to be software triggered
-                if (cams[i].is_master()) { 
-                    if (MAX_RATE_SAVE_){
-                      cams[i].setEnumValue("LineSelector", "Line2");
-                      cams[i].setEnumValue("LineMode", "Output");
-                      cams[i].setBoolValue("AcquisitionFrameRateEnable", false);
-                      //cams[i].setFloatValue("AcquisitionFrameRate", 170);
-                    }else{
-                      /*cams[i].setEnumValue("TriggerMode", "On");
-                      cams[i].setEnumValue("LineSelector", "Line2");
-                      cams[i].setEnumValue("LineMode", "Output");
-                      cams[i].setEnumValue("TriggerSource", "Software");*/
-                    }
-                    //cams[i].setEnumValue("LineSource", "ExposureActive");
+                else
+                    cams[i].setEnumValue("PixelFormat", "Mono8");
 
-
+                if (!trigger_slave_from_master_) {
+                    cams[i].setEnumValue("AcquisitionMode", "Continuous");
+                    cams[i].setEnumValue("TriggerMode", "Off");
                 } else {
-		  /*cams[i].setEnumValue("TriggerMode", "On");
-                    cams[i].setEnumValue("LineSelector", "Line3");
-                    cams[i].setEnumValue("TriggerSource", "Line3");
-                    cams[i].setEnumValue("TriggerSelector", "FrameStart");
-                    cams[i].setEnumValue("LineMode", "Input");
-                    
-//                    cams[i].setFloatValue("TriggerDelay", 40.0);
-                    cams[i].setEnumValue("TriggerOverlap", "ReadOut");//"Off"
-                    cams[i].setEnumValue("TriggerActivation", "RisingEdge");*/
+                    // set only master to be software triggered
+                    if (cams[i].is_master()) {
+                        cams[i].setEnumValue("AcquisitionMode", "Continuous");
+                        cams[i].setEnumValue("TriggerMode", "Off");
+
+                        cams[i].setEnumValue("LineSelector", "Line2");
+                        cams[i].setEnumValue("LineMode", "Output");
+                        cams[i].setEnumValue("LineSource", "ExposureActive");
+
+                    } else {
+                        cams[i].setEnumValue("TriggerMode", "On");
+                        cams[i].setEnumValue("TriggerSource", "Line3");
+                        cams[i].setEnumValue("TriggerSelector", "FrameStart");
+                        //cams[i].setEnumValue("LineSelector", "Line3");
+                        //cams[i].setEnumValue("LineMode", "Input");
+                        cams[i].setEnumValue("TriggerOverlap", "ReadOut");
+
+                        /*cams[i].setFloatValue("TriggerDelay", 40.0);
+                        cams[i].setEnumValue("TriggerActivation", "RisingEdge");*/
+                    }
                 }
             }
         }
@@ -689,6 +714,22 @@ void acquisition::Capture::init_cameras(bool soft = false) {
 
     }
     ROS_DEBUG_STREAM("All cameras initialized.");
+}
+
+bool acquisition::Capture::onEnable(std_srvs::SetBool::Request& req, std_srvs::SetBool::Response& res)
+{
+  cout << "enable service callback before lock\n";
+  const lock_guard<mutex> lock(enabled_mutex_);
+  cout << "enable service callback " << (req.data ? 1 : 0)  << "\n";
+  if (req.data) {
+    start_acquisition();
+    enabled_ = true;
+  } else {
+    enabled_ = false;
+    end_acquisition();
+  }
+  res.success = true;
+  return true;
 }
 
 void acquisition::Capture::start_acquisition() {
@@ -852,7 +893,11 @@ void acquisition::Capture::get_mat_images() {
     
     int frameID;
     int fid_mismatch = 0;
-   
+
+    const lock_guard<mutex> lock(enabled_mutex_);
+    if (!enabled_) {
+        return;
+    }
 
     for (int i=0; i<numCameras_; i++) {
         //ROS_INFO_STREAM("CAM ID IS "<< i);
@@ -908,6 +953,16 @@ void acquisition::Capture::run_soft_trig() {
     ros::Rate ros_rate(soft_framerate_);
     try{
         while( ros::ok() ) {
+
+            bool enabled = true;
+            {
+                const lock_guard<mutex> lock(enabled_mutex_);
+                enabled = enabled_;
+            }
+            if (!enabled) {
+                ros_rate.sleep();
+                continue;
+            }
 
             double t = ros::Time::now().toSec();
 
@@ -982,7 +1037,11 @@ void acquisition::Capture::run_soft_trig() {
                 }
             }
             
-            if (EXPORT_TO_ROS_) export_to_ROS();
+	    rate_cut_++;
+	    if (rate_cut_ >= rate_div_) {
+	      if (EXPORT_TO_ROS_) export_to_ROS();
+	      rate_cut_ = 0;
+	    }
             //cams[MASTER_CAM_].targetGreyValueTest();
             // ros publishing messages
             acquisition_pub.publish(mesg);
@@ -1203,7 +1262,7 @@ std::string acquisition::Capture::todays_date()
 void acquisition::Capture::dynamicReconfigureCallback(spinnaker_sdk_camera_driver::spinnaker_camConfig &config, uint32_t level){
     
     ROS_INFO_STREAM("Dynamic Reconfigure: Level : " << level);
-    if(level == 1 || level ==3){
+    if(level & 1){
         ROS_INFO_STREAM("Target grey value : " << config.target_grey_value);
         for (int i = numCameras_-1 ; i >=0 ; i--) {
             
@@ -1211,7 +1270,7 @@ void acquisition::Capture::dynamicReconfigureCallback(spinnaker_sdk_camera_drive
             cams[i].setFloatValue("AutoExposureTargetGreyValue", config.target_grey_value);
         }
     }
-    if (level == 2 || level ==3){
+    if (level & (1 << 1)){
         ROS_INFO_STREAM("Exposure "<<config.exposure_time);
         if(config.exposure_time > 0){
             for (int i = numCameras_-1 ; i >=0 ; i--) {
@@ -1227,5 +1286,30 @@ void acquisition::Capture::dynamicReconfigureCallback(spinnaker_sdk_camera_drive
                 cams[i].setEnumValue("ExposureMode", "Timed");
             }
         }
+    }
+    for (int i = numCameras_-1 ; i >=0 ; i--) {
+        if (level & (1 << (2+i))) {
+  	    double gain = gain_;
+	    switch (i) {
+		case 0:
+		    gain = config.gain_0;
+		    break;
+		case 1:
+		    gain = config.gain_1;
+		    break;
+		case 2:
+		    gain = config.gain_2;
+		    break;
+	    }
+
+  	    ROS_INFO_STREAM("Level " << level << "; Gain " << i << " " << gain);
+	    if(gain >= 0.0){
+		cams[i].setEnumValue("GainAuto", "Off");
+		cams[i].setFloatValue("Gain", gain);
+	    }
+	    else {
+		cams[i].setEnumValue("GainAuto", "Continuous");
+	    }
+	}
     }
 }
